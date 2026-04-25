@@ -29,7 +29,7 @@ const customHelp = () => {
   console.log(logo);
   console.log();
   console.log(chalk.gray(`  CLI plugin manager for SyntaxError! ManyBot`));
-  console.log(chalk.dim(`  https://codeberg.com/synt-xerror/manybot`));
+  console.log(chalk.dim(`  https://git.maneos.net/ManyBot/manyplug`));
   console.log();
 
   console.log(chalk.bold.cyan('  Commands:'));
