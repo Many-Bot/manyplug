@@ -57,8 +57,18 @@ program
 program.hook('preAction', () => {});
 
 // Sobrescreve o outputHelp para não imprimir nada (nosso customHelp cuida disso)
+// But allow version output to pass through
+let versionOutputEnabled = false;
+if (process.argv.includes('-v') || process.argv.includes('--version')) {
+  versionOutputEnabled = true;
+}
+
 program.configureOutput({
-  writeOut: () => {},
+  writeOut: (str) => {
+    if (versionOutputEnabled) {
+      process.stdout.write(str);
+    }
+  },
   writeErr: (str) => process.stderr.write(str),
 });
 
