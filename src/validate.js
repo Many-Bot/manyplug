@@ -1,277 +1,121 @@
 import fs from 'fs-extra';
 import path from 'path';
 import { execSync } from 'node:child_process';
-import { logger, createSpinner, createTable, ICONS, THEME, formatDuration, createBox } from './ui.js';
-import chalk from 'chalk';
 
-// ============================================================
-// UTILS
-// ============================================================
-function checkCommandExists(command) {
-	try {
-		const isWindows = process.platform === 'win32';
-		const checkCmd = isWindows ? `where ${command}` : `command -v ${command}`;
-		execSync(checkCmd, { stdio: 'pipe' });
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-// ============================================================
-// VALIDATION SCHEMA
-// ============================================================
 const VALID_CATEGORIES = ['games', 'media', 'utility', 'service', 'admin', 'fun'];
 
-const REQUIRED_FIELDS = ['name', 'version', 'category'];
-const OPTIONAL_FIELDS = ['service', 'local', 'description', 'author', 'license', 'main', 'dependencies', 'externalDependencies'];
-const VALID_FIELDS = [...REQUIRED_FIELDS, ...OPTIONAL_FIELDS];
+// ------------------------------------------------------------
+// rules — each returns an error string or null
+// ------------------------------------------------------------
 
-// ============================================================
-// VALIDATION RULES
-// ============================================================
-const rules = {
-	name: {
-		validate: (value) => {
-			if (typeof value !== 'string') return 'Must be a string';
-			if (!value) return 'Required';
-			if (!/^[a-z0-9-]+$/.test(value)) {
-				return 'Must contain only lowercase letters, numbers, and hyphens';
-			}
-			if (value.length < 2) return 'Must be at least 2 characters';
-			if (value.length > 50) return 'Must be at most 50 characters';
-			return null;
+const RULES = {
+	name:    v => typeof v !== 'string' || !v              ? 'required string'
+	            : !/^[a-z0-9-]+$/.test(v)                  ? 'lowercase letters, numbers, hyphens only'
+	            : v.length < 2 || v.length > 50             ? 'length must be 2-50'
+	            : null,
+
+	version: v => typeof v !== 'string' || !v              ? 'required string'
+	            : !/^\d+\.\d+\.\d+/.test(v)                ? 'must be semver (e.g. 1.0.0)'
+	            : null,
+
+	category: v => !VALID_CATEGORIES.includes(v)           ? `must be one of: ${VALID_CATEGORIES.join(', ')}`
+	             : null,
+
+	service:  v => v !== undefined && typeof v !== 'boolean' ? 'must be boolean' : null,
+	local:    v => v !== undefined && typeof v !== 'boolean' ? 'must be boolean' : null,
+	main:     v => v !== undefined && typeof v !== 'string'  ? 'must be string'  : null,
+
+	dependencies:         v => v !== undefined && typeof v !== 'object' ? 'must be object' : null,
+	externalDependencies: v => {
+		if (v === undefined) return null;
+		if (typeof v !== 'object') return 'must be object';
+		for (const [n, c] of Object.entries(v)) {
+			if (typeof c === 'string') continue;
+			if (typeof c !== 'object') return `${n}: must be string or object`;
+			if (c.command  !== undefined && typeof c.command  !== 'string')  return `${n}.command must be string`;
+			if (c.optional !== undefined && typeof c.optional !== 'boolean') return `${n}.optional must be boolean`;
 		}
-	},
-	version: {
-		validate: (value) => {
-			if (typeof value !== 'string') return 'Must be a string';
-			if (!value) return 'Required';
-			if (!/^\d+\.\d+\.\d+/.test(value)) {
-				return 'Must follow semantic versioning (e.g., 1.0.0)';
-			}
-			return null;
-		}
-	},
-	category: {
-		validate: (value) => {
-			if (typeof value !== 'string') return 'Must be a string';
-			if (!VALID_CATEGORIES.includes(value)) {
-				return `Must be one of: ${VALID_CATEGORIES.join(', ')}`;
-			}
-			return null;
-		}
-	},
-	service: {
-		validate: (value) => {
-			if (value !== undefined && typeof value !== 'boolean') {
-				return 'Must be a boolean';
-			}
-			return null;
-		}
-	},
-	local: {
-		validate: (value) => {
-			if (value !== undefined && typeof value !== 'boolean') {
-				return 'Must be a boolean';
-			}
-			return null;
-		}
-	},
-	dependencies: {
-		validate: (value) => {
-			if (value !== undefined && typeof value !== 'object') {
-				return 'Must be an object';
-			}
-			return null;
-		}
-	},
-	main: {
-		validate: (value) => {
-			if (value !== undefined && typeof value !== 'string') {
-				return 'Must be a string';
-			}
-			return null;
-		}
-	},
-	externalDependencies: {
-		validate: (value) => {
-			if (value === undefined) return null;
-			if (typeof value !== 'object') {
-				return 'Must be an object';
-			}
-			for (const [name, config] of Object.entries(value)) {
-				if (typeof config === 'string') continue;
-				if (typeof config === 'object') {
-					if (config.command && typeof config.command !== 'string') {
-						return `externalDependencies.${name}.command must be a string`;
-					}
-					if (config.optional !== undefined && typeof config.optional !== 'boolean') {
-						return `externalDependencies.${name}.optional must be a boolean`;
-					}
-				} else {
-					return `externalDependencies.${name} must be a string or object`;
-				}
-			}
-			return null;
-		}
+		return null;
 	}
 };
 
-// ============================================================
-// VALIDATE COMMAND
-// ============================================================
-export async function validateCommand(pluginPath = '.') {
-	const startTime = Date.now();
-	const absPath = path.resolve(pluginPath);
+const REQUIRED = ['name', 'version', 'category'];
+const KNOWN    = new Set([...REQUIRED, 'service', 'local', 'description', 'author', 'license', 'main', 'dependencies', 'externalDependencies']);
 
-	const spinner = createSpinner('Validating plugin...');
-	spinner.start();
-
-	// Check if path exists
-	if (!await fs.pathExists(absPath)) {
-		spinner.fail(`Path not found: ${pluginPath}`);
-		process.exit(1);
-	}
-
-	// Find manyplug.json
-	const manifestPath = path.join(absPath, 'manyplug.json');
-	if (!await fs.pathExists(manifestPath)) {
-		spinner.fail(`No manyplug.json found in ${pluginPath}`);
-		logger.tip('Run "manyplug init <name>" to create a valid plugin structure');
-		process.exit(1);
-	}
-
-	// Load manifest
-	let manifest;
+function commandExists(cmd) {
 	try {
-		manifest = await fs.readJson(manifestPath);
-	} catch (err) {
-		spinner.fail(`Failed to parse manyplug.json: ${err.message}`);
+		execSync(process.platform === 'win32' ? `where ${cmd}` : `command -v ${cmd}`, { stdio: 'pipe' });
+		return true;
+	} catch { return false; }
+}
+
+// ------------------------------------------------------------
+// validate command
+// ------------------------------------------------------------
+
+export async function validateCommand(pluginPath = '.') {
+	const abs = path.resolve(pluginPath);
+
+	if (!await fs.pathExists(abs)) {
+		console.error(`error: path not found: ${pluginPath}`);
 		process.exit(1);
 	}
 
-	// Run validations
-	const errors = [];
-	const warnings = [];
-
-	// Check required fields
-	for (const field of REQUIRED_FIELDS) {
-		if (!(field in manifest)) {
-			errors.push({ field, message: `Missing required field` });
-		}
+	const manifestPath = path.join(abs, 'manyplug.json');
+	if (!await fs.pathExists(manifestPath)) {
+		console.error(`error: manyplug.json not found in ${pluginPath}`);
+		console.error('  hint: run "manyplug init <name>" to scaffold a plugin');
+		process.exit(1);
 	}
 
-	// Validate all fields
-	for (const [field, value] of Object.entries(manifest)) {
-		if (!VALID_FIELDS.includes(field)) {
-			warnings.push({ field, message: `Unknown field` });
-			continue;
-		}
+	let manifest;
+	try { manifest = await fs.readJson(manifestPath); }
+	catch (e) { console.error(`error: invalid manyplug.json: ${e.message}`); process.exit(1); }
 
-		if (rules[field]) {
-			const error = rules[field].validate(value);
-			if (error) {
-				errors.push({ field, message: error });
-			}
-		}
+	const errors = [], warnings = [];
+	const err  = (field, msg) => errors.push(`  error   ${field.padEnd(24)} ${msg}`);
+	const warn = (field, msg) => warnings.push(`  warning ${field.padEnd(24)} ${msg}`);
+
+	// required fields
+	for (const f of REQUIRED)
+		if (!(f in manifest)) err(f, 'missing required field');
+
+	// field rules
+	for (const [f, v] of Object.entries(manifest)) {
+		if (!KNOWN.has(f)) { warn(f, 'unknown field'); continue; }
+		const msg = RULES[f]?.(v);
+		if (msg) err(f, msg);
 	}
 
-	// Validate entry point exists
-	const mainFile = manifest.main || 'index.js';
-	const mainPath = path.join(absPath, mainFile);
-	if (!await fs.pathExists(mainPath)) {
-		warnings.push({ field: 'main', message: `Entry point not found: ${mainFile}` });
+	// entry point
+	const main = manifest.main || 'index.js';
+	if (!await fs.pathExists(path.join(abs, main)))
+		warn('main', `entry point not found: ${main}`);
+
+	// locale
+	if (!await fs.pathExists(path.join(abs, 'locale')))
+		warn('locale', 'no locale/ directory (i18n recommended)');
+
+	// external deps
+	for (const [n, c] of Object.entries(manifest.externalDependencies || {})) {
+		const cmd = typeof c === 'string' ? c : c.command;
+		const opt = typeof c === 'object' && c.optional;
+		if (!commandExists(cmd))
+			(opt ? warn : err)(`externalDeps.${n}`, `command not found: ${cmd}`);
 	}
 
-	// Check locale directory (optional but recommended)
-	const localePath = path.join(absPath, 'locale');
-	if (!await fs.pathExists(localePath)) {
-		warnings.push({ field: 'locale', message: 'No locale directory (i18n recommended)' });
-	}
+	// output
+	const name = manifest.name || path.basename(abs);
+	console.log(`${name}@${manifest.version || '?'}  path=${abs}`);
 
-	// Check external dependencies
-	if (manifest.externalDependencies) {
-		for (const [name, config] of Object.entries(manifest.externalDependencies)) {
-			const command = typeof config === 'string' ? config : config.command;
-			const isOptional = typeof config === 'object' && config.optional === true;
-
-			const exists = checkCommandExists(command);
-			if (!exists) {
-				const msg = `"${name}" not found (command: ${command})`;
-				if (isOptional) {
-					warnings.push({ field: `externalDeps.${name}`, message: `${msg} [optional]` });
-				} else {
-					errors.push({ field: `externalDeps.${name}`, message: msg });
-				}
-			}
-		}
-	}
-
-	spinner.stop();
-
-	// Output results
-	const duration = Date.now() - startTime;
-	const pluginName = manifest.name || 'unknown';
-
-	logger.header('Validation Report');
-
-	// Plugin info box
-	const infoLines = [
-		`${ICONS.package} ${chalk.bold.white(pluginName)} ${manifest.version ? chalk.green(manifest.version) : ''}`,
-		`${chalk.gray('Path:')} ${chalk.cyan(absPath)}`,
-	];
-	if (manifest.description) {
-		infoLines.push(`${chalk.gray('Desc:')} ${manifest.description}`);
-	}
-	console.log(createBox(infoLines.join('\n'), { width: 60 }));
-
-	// Results table
-	if (errors.length > 0 || warnings.length > 0) {
-		logger.newline();
-
-		if (errors.length > 0) {
-			console.log(chalk.red.bold('  ✗ Errors:'));
-			const errorTable = createTable(
-				errors.map(e => ({ field: e.field, message: e.message })),
-				[
-					{ key: 'field', header: 'Field', minWidth: 20, format: v => chalk.white(v) },
-					{ key: 'message', header: 'Issue', minWidth: 30, format: v => chalk.red(v) }
-				],
-				{ compact: true }
-			);
-			console.log(errorTable.toString());
-		}
-
-		if (warnings.length > 0) {
-			if (errors.length > 0) logger.newline();
-			console.log(chalk.yellow.bold('  ⚠ Warnings:'));
-			const warnTable = createTable(
-				warnings.map(w => ({ field: w.field, message: w.message })),
-				[
-					{ key: 'field', header: 'Field', minWidth: 20, format: v => chalk.white(v) },
-					{ key: 'message', header: 'Issue', minWidth: 30, format: v => chalk.yellow(v) }
-				],
-				{ compact: true }
-			);
-			console.log(warnTable.toString());
-		}
+	if (errors.length || warnings.length) {
+		if (errors.length)   console.log('\n' + errors.join('\n'));
+		if (warnings.length) console.log('\n' + warnings.join('\n'));
 	} else {
-		logger.newline();
-		console.log(`  ${ICONS.success} ${chalk.green.bold('All validations passed!')}`);
+		console.log('ok  all checks passed');
 	}
 
-	logger.separator();
+	console.log(`\nerrors=${errors.length}  warnings=${warnings.length}`);
 
-	// Summary
-	const status = errors.length === 0 ? 'valid' : 'invalid';
-	const statusColor = errors.length === 0 ? chalk.green : chalk.red;
-	console.log(`  ${chalk.gray('Status:')} ${statusColor.bold(status.toUpperCase())}`);
-	console.log(`  ${chalk.gray('Errors:')} ${errors.length > 0 ? chalk.red(errors.length) : chalk.gray(0)}`);
-	console.log(`  ${chalk.gray('Warnings:')} ${warnings.length > 0 ? chalk.yellow(warnings.length) : chalk.gray(0)}`);
-	console.log(`  ${chalk.gray('Time:')} ${formatDuration(duration)}`);
-
-	if (errors.length > 0) {
-		process.exit(1);
-	}
+	if (errors.length) process.exit(1);
 }

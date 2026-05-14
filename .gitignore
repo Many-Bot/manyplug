@@ -1,6 +1,7 @@
 node_modules/
 plugins/
 registry.json
+manybot.conf
 .claude/
 coverage/
 test-plugin/

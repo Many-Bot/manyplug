@@ -1,235 +1,90 @@
-import { existsSync, readFileSync } from "fs";
 import fs from 'fs-extra';
-import { fileURLToPath } from 'url';
-import { logger, createTable } from './ui.js';
-import chalk from 'chalk';
-
 import path from 'path';
-const { resolve } = path;
+import { existsSync, readFileSync } from 'fs';
 
-const configPath = resolve(process.cwd(), "manybot.conf");
+const CONF_PATH   = path.resolve(process.cwd(), 'manybot.conf');
+const PLUGINS_DIR = path.join(process.cwd(), 'src', 'plugins');
 
-// Parse INI-style config file (key=value format)
-function parseConfig(filePath) {
-	const config = {};
-	if (!existsSync(filePath)) {
-		return config;
-	}
+// ------------------------------------------------------------
+// conf — reuse same parser as enable-disable reads
+// ------------------------------------------------------------
 
-	try {
-		const content = readFileSync(filePath, 'utf-8');
-		const lines = content.split('\n');
-		let currentKey = null;
-		let currentValue = null;
-
-		for (const line of lines) {
-			const trimmed = line.trim();
-			// Skip comments and empty lines
-			if (!trimmed || trimmed.startsWith('#')) continue;
-
-			// Check if we're collecting a multi-line array
-			if (currentKey !== null) {
-				currentValue += '\n' + trimmed;
-				if (trimmed.endsWith(']')) {
-					// End of array
-					config[currentKey] = parseArrayValue(currentValue);
-					currentKey = null;
-					currentValue = null;
-				}
-				continue;
-			}
-
-			// Match key=value or key=[value1, value2]
-			const match = trimmed.match(/^([^=]+)=(.*)$/);
-			if (match) {
-				const key = match[1].trim();
-				let value = match[2].trim();
-
-				// Check for multi-line array (starts with [ but doesn't end with ])
-				if (value.startsWith('[') && !value.endsWith(']')) {
-					currentKey = key;
-					currentValue = value;
-					continue;
-				}
-
-				// Parse array format: [item1, item2]
-				if (value.startsWith('[') && value.endsWith(']')) {
-					value = parseArrayValue(value);
-				}
-
-				config[key] = value;
-			}
-		}
-	} catch (err) {
-		// Silent fail, return empty config
-	}
-
-	return config;
+function readEnabled() {
+	if (!existsSync(CONF_PATH)) return new Set();
+	const match = readFileSync(CONF_PATH, 'utf-8').match(/PLUGINS=\[\s*([\s\S]*?)\s*\]/);
+	if (!match) return new Set();
+	return new Set(match[1].split(',').map(s => s.trim().toLowerCase()).filter(Boolean));
 }
 
-// Parse array value like "[item1, item2]" or multi-line "[\nitem1,\nitem2\n]"
-function parseArrayValue(value) {
-	return value
-		.slice(1, -1)
-		.split(',')
-		.map(v => v.trim().toLowerCase())
-		.filter(v => v.length > 0);
-}
+// ------------------------------------------------------------
+// list command
+// ------------------------------------------------------------
 
-const config = parseConfig(configPath);
-const PLUGINS = config.PLUGINS || [];
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// ============================================================
-// CONFIG
-// ============================================================
-function getPluginsDir() {
-	const baseDir = process.cwd();
-	return path.join(baseDir, 'src', 'plugins');
-}
-
-const PLUGINS_DIR = getPluginsDir();
-
-// ============================================================
-// LIST COMMAND
-// ============================================================
-export async function listCommand(options) {
-	logger.header('Installed Plugins');
-
+export async function listCommand(options = {}) {
 	if (!await fs.pathExists(PLUGINS_DIR)) {
-		logger.warn('No plugins directory found');
-		logger.info(`Expected at: ${PLUGINS_DIR}`);
+		console.error(`error: plugins dir not found: ${PLUGINS_DIR}`);
 		return;
 	}
 
-	const entries = await fs.readdir(PLUGINS_DIR, { withFileTypes: true });
+	const enabled = readEnabled();
+	const entries = (await fs.readdir(PLUGINS_DIR, { withFileTypes: true })).filter(e => e.isDirectory());
 	const plugins = [];
 
 	for (const entry of entries) {
-		if (!entry.isDirectory()) continue;
+		const dir          = path.join(PLUGINS_DIR, entry.name);
+		const manifestPath = path.join(dir, 'manyplug.json');
+		const hasEntry     = await fs.pathExists(path.join(dir, 'index.js'));
+		const isEnabled    = enabled.has(entry.name.toLowerCase());
 
-		const manifestPath = path.join(PLUGINS_DIR, entry.name, 'manyplug.json');
-		const indexPath = path.join(PLUGINS_DIR, entry.name, 'index.js');
-
-		const exists = await fs.pathExists(manifestPath);
-		if (!exists && !options.all) continue;
-
-		let manifest = null;
-		let hasEntry = await fs.pathExists(indexPath);
-		let isEnabled = PLUGINS.includes(entry.name.toLowerCase());
-
-		if (exists) {
-			try {
-				manifest = await fs.readJson(manifestPath);
-			} catch {
-				manifest = { name: entry.name, version: '?', category: 'unknown', error: true };
-			}
-		} else {
-			manifest = { name: entry.name, category: 'unknown', noManifest: true };
-		}
-
-		// Skip disabled plugins unless --all flag is used
 		if (!isEnabled && !options.all) continue;
 
+		let manifest = {};
+		try { manifest = await fs.readJson(manifestPath); }
+		catch { manifest = { name: entry.name, version: '?', category: '?', _error: true }; }
+
 		plugins.push({
-			name: manifest.name || entry.name,
-			version: manifest.version || '-',
+			name:     manifest.name || entry.name,
+			version:  manifest.version || '-',
 			category: manifest.category || '-',
-			service: manifest.service === true,
-			local: manifest.local === true,
-			enabled: isEnabled,
+			service:  manifest.service === true,
+			local:    manifest.local   === true,
+			enabled:  isEnabled,
 			hasEntry,
-			error: manifest.error,
-			noManifest: manifest.noManifest,
-			path: path.join(PLUGINS_DIR, entry.name)
+			_error:   manifest._error || false,
 		});
 	}
 
-	if (plugins.length === 0) {
-		logger.info('No plugins found');
-		logger.tip('Use --all to see disabled plugins');
+	if (!plugins.length) {
+		console.log(options.all ? 'no plugins installed' : 'no enabled plugins  (use --all to see all)');
 		return;
 	}
 
-	// Build table columns
-	const columns = [
-		{
-			key: 'indicator',
-			header: '',
-			minWidth: 2,
-			format: (_, row) => {
-				if (row.local) return chalk.magenta('L');
-				if (row.error) return chalk.yellow('!');
-				return ' ';
-			}
-		},
-		{
-			key: 'name',
-			header: 'Name',
-			minWidth: 15,
-			format: (val, row) => {
-				if (row.local) return chalk.magenta(val);
-				if (row.noManifest) return chalk.gray(val);
-				return chalk.white.bold(val);
-			}
-		},
-		{
-			key: 'version',
-			header: 'Version',
-			minWidth: 8,
-			format: (val, row) => row.local ? chalk.magenta(val) : chalk.green(val)
-		},
-		{
-			key: 'category',
-			header: 'Category',
-			minWidth: 10,
-			format: (val) => chalk.cyan(val)
-		},
-		{
-			key: 'type',
-			header: 'Type',
-			minWidth: 4,
-			format: (_, row) => row.service ? chalk.cyan('●') : chalk.gray('○')
-		},
-		{
-			key: 'status',
-			header: 'Status',
-			minWidth: 10,
-			format: (_, row) => {
-				if (!row.hasEntry) return chalk.yellow('incomplete');
-				return row.enabled ? chalk.green('enabled') : chalk.gray('disabled');
-			}
-		}
-	];
+	// column widths
+	const w = {
+		name:     Math.max(4, ...plugins.map(p => p.name.length)),
+		version:  Math.max(7, ...plugins.map(p => p.version.length)),
+		category: Math.max(8, ...plugins.map(p => p.category.length)),
+	};
 
-	// Create and display table
-	const table = createTable(plugins, columns, { spacing: 2 });
-	logger.newline();
-	console.log(table.toString());
+	const pad = (s, n) => s.padEnd(n);
+	const header = `  ${'name'.padEnd(w.name)}  ${'version'.padEnd(w.version)}  ${'category'.padEnd(w.category)}  type  status`;
+	console.log(header);
+	console.log('  ' + '-'.repeat(header.length - 2));
 
-	// Summary
-	const enabledCount = plugins.filter(p => p.enabled).length;
-	const disabledCount = plugins.length - enabledCount;
-	const localCount = plugins.filter(p => p.local).length;
-	const incompleteCount = plugins.filter(p => !p.hasEntry).length;
-
-	logger.newline();
-	logger.separator();
-	console.log(`  ${chalk.white('Total:')} ${chalk.white.bold(plugins.length)} plugin(s)`);
-	console.log(`  ${chalk.green('●')} enabled: ${chalk.green(enabledCount)}`);
-	if (disabledCount > 0) {
-		console.log(`  ${chalk.gray('○')} disabled: ${chalk.gray(disabledCount)}`);
+	for (const p of plugins) {
+		const flag   = p.local ? 'L' : p._error ? '!' : ' ';
+		const type   = p.service ? 'svc' : 'std';
+		const status = !p.hasEntry ? 'incomplete' : p.enabled ? 'enabled' : 'disabled';
+		console.log(`${flag} ${pad(p.name, w.name)}  ${pad(p.version, w.version)}  ${pad(p.category, w.category)}  ${pad(type, 4)}  ${status}`);
 	}
-	if (localCount > 0) {
-		console.log(`  ${chalk.magenta('L')} local: ${chalk.magenta(localCount)}`);
-	}
-	if (incompleteCount > 0) {
-		console.log(`  ${chalk.yellow('!')} incomplete: ${chalk.yellow(incompleteCount)}`);
-	}
-	logger.separator();
 
-	logger.newline();
-	logger.tip('Legend: L=local, ●=service, ○=standard, !=missing entry point');
+	// summary
+	const en   = plugins.filter(p => p.enabled).length;
+	const dis  = plugins.length - en;
+	const loc  = plugins.filter(p => p.local).length;
+	const inc  = plugins.filter(p => !p.hasEntry).length;
+
+	console.log('');
+	console.log(`total=${plugins.length} enabled=${en} disabled=${dis}${loc ? ' local=' + loc : ''}${inc ? ' incomplete=' + inc : ''}`);
+	console.log('L=local  svc=service  std=standard  !=missing index.js');
 }

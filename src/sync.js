@@ -1,288 +1,179 @@
 import fs from 'fs-extra';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { logger, createSpinner, ICONS, THEME, createTable, formatDuration } from './ui.js';
-import chalk from 'chalk';
+import { formatSize } from './ui.js';
+import { loadLocalRegistry, saveRegistry, fetchRemoteRegistry } from './registry-ops.js';
+import { installPluginFromRepo, installNpmDeps } from './utils.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PLUGINS_DIR = path.join(process.cwd(), 'src', 'plugins');
 
-// ============================================================
-// CONFIG
-// ============================================================
-function getPluginsDir() {
-  const baseDir = process.cwd();
-  return path.join(baseDir, 'src', 'plugins');
+// ------------------------------------------------------------
+// helpers
+// ------------------------------------------------------------
+
+function elapsed(since) { return ((Date.now() - since) / 1000).toFixed(2); }
+
+function onMirror(mirror, status, err) {
+	console.log(`  ${status === 'ok' ? '+' : 'x'} ${mirror.name}${err ? ': ' + err : ''}`);
 }
 
-function getRegistryPath() {
-  const baseDir = process.cwd();
-  if (fs.existsSync(path.join(baseDir, 'registry.json'))) {
-    return path.join(baseDir, 'registry.json');
-  }
-  return path.join(baseDir, 'registry.json');
+async function fetchRegistry() {
+	process.stdout.write('fetching registry... ');
+	try {
+		const r = await fetchRemoteRegistry(onMirror);
+		console.log('ok');
+		return r;
+	} catch (e) {
+		console.error(`failed: ${e.message}`);
+		process.exit(1);
+	}
 }
 
-const PLUGINS_DIR = getPluginsDir();
-const REGISTRY_PATH = getRegistryPath();
-
-function loadConfig(key) {
-  const configPath = path.join(path.resolve(__dirname, '..'), 'config.json');
-  try {
-    const data = fs.readJsonSync(configPath);
-    if (typeof key == 'string'){
-      return data[key];
-    }
-    return data;
-  } catch (err) {
-    logger.error(`Could not load config file: ${err.message}`);
-    logger.info('Make sure config.json exists in your project root');
-    process.exit(1);
-  }
+async function installDeps(manifest, targetDir) {
+	const deps = manifest.dependencies;
+	if (!deps || !Object.keys(deps).length) return;
+	await installNpmDeps(deps, targetDir);
 }
 
-const MIRRORS = loadConfig("mirrors");
+// ------------------------------------------------------------
+// sync command — reconcile local registry with remote
+// ------------------------------------------------------------
 
-// ============================================================
-// REGISTRY OPERATIONS
-// ============================================================
-async function loadLocalRegistry() {
-  try {
-    return await fs.readJson(REGISTRY_PATH);
-  } catch {
-    return {
-      lastUpdated: new Date().toISOString(),
-      plugins: {}
-    };
-  }
-}
-
-async function loadRemoteRegistry(mirrorFetchUrl) {
-  const url = `${mirrorFetchUrl}/registry.json`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
-  }
-  return await res.json();
-}
-
-async function fetchRemoteRegistry(spinner) {
-  logger.info('Checking mirrors...');
-
-  for (const mirror of MIRRORS) {
-    try {
-      spinner.setText(`Trying ${mirror.name}...`);
-      const registry = await loadRemoteRegistry(mirror.fetch);
-      logger.mirror(mirror.name, 'ok');
-      return { remoteRegistry: registry, selectedMirror: mirror };
-    } catch (err) {
-      logger.mirror(mirror.name, 'fail');
-    }
-  }
-
-  throw new Error('Could not fetch data from any mirror.');
-}
-
-async function saveRegistry(registry) {
-  registry.lastUpdated = new Date().toISOString();
-  await fs.writeJson(REGISTRY_PATH, registry, { spaces: 2 });
-}
-
-// ============================================================
-// SYNC COMMAND
-// ============================================================
 export async function syncCommand(options = {}) {
-  const startTime = Date.now();
+	const t = Date.now();
+	const { remoteRegistry, selectedMirror } = await fetchRegistry();
+	const local = await loadLocalRegistry();
 
-  logger.newline();
-  logger.header('Sync Registry');
+	const synced   = {};
+	const added    = [], updated = [], kept = [], localOnly = [], skipped = [];
 
-  const spinner = createSpinner('Fetching remote registry...');
-  spinner.start();
+	// reconcile local plugins against remote
+	for (const [name, lm] of Object.entries(local.plugins || {})) {
+		if (lm.local) {
+			localOnly.push(name);
+			synced[name] = lm;
+			continue;
+		}
+		const rm = remoteRegistry.plugins?.[name];
+		if (rm && lm.version !== rm.version) {
+			updated.push(`${name} ${lm.version}->${rm.version}`);
+			synced[name] = rm;
+		} else {
+			kept.push(name);
+			synced[name] = lm;
+		}
+	}
 
-  // Fetch remote registry
-  let remoteRegistry;
-  let selectedMirror;
-  try {
-    const result = await fetchRemoteRegistry(spinner);
-    remoteRegistry = result.remoteRegistry;
-    selectedMirror = result.selectedMirror;
-    spinner.succeed('Registry fetched');
-  } catch (err) {
-    spinner.fail(`Failed: ${err.message}`);
-    process.exit(1);
-  }
+	// plugins in remote not installed locally
+	for (const [name, rm] of Object.entries(remoteRegistry.plugins || {})) {
+		if (!local.plugins?.[name]) skipped.push(name);
+	}
 
-  // Load local registry
-  const localRegistry = await loadLocalRegistry();
+	// plugins on disk not in registry
+	if (await fs.pathExists(PLUGINS_DIR)) {
+		for (const entry of await fs.readdir(PLUGINS_DIR, { withFileTypes: true })) {
+			if (!entry.isDirectory() || synced[entry.name]) continue;
+			const mp = path.join(PLUGINS_DIR, entry.name, 'manyplug.json');
+			if (!await fs.pathExists(mp)) continue;
+			try {
+				const manifest = await fs.readJson(mp);
+				added.push(entry.name);
+				synced[entry.name] = manifest;
+			} catch {}
+		}
+	}
 
-  // Sync: Keep local plugins, add/update from remote
-  const syncedPlugins = {};
-  const newPlugins = [];
-  const updatedPlugins = [];
-  const keptPlugins = [];
-  const removedPlugins = [];
+	// summary
+	if (added.length)    console.log(`+ added:    ${added.join(', ')}`);
+	if (updated.length)  console.log(`~ updated:  ${updated.join(', ')}`);
+	if (kept.length)     console.log(`= kept:     ${kept.length} plugin(s)`);
+	if (localOnly.length) console.log(`L local:    ${localOnly.join(', ')}`);
+	if (skipped.length)  console.log(`- skipped:  ${skipped.length} not installed`);
 
-  const localPlugins = [];
+	console.log(`  source:  ${selectedMirror.name}`);
+	console.log(`  synced:  ${Object.keys(synced).length} plugin(s)`);
 
-  // First, keep all local plugins that exist in remote (update them)
-  // or exist only locally (keep them as source of truth)
-  for (const [name, localManifest] of Object.entries(localRegistry.plugins || {})) {
-    const remoteManifest = remoteRegistry.plugins?.[name];
+	const hasChanges = added.length || updated.length;
+	if (hasChanges || options.force) {
+		process.stdout.write('saving registry... ');
+		try {
+			await saveRegistry({ plugins: synced });
+			console.log('ok');
+		} catch (e) {
+			console.error(`failed: ${e.message}`);
+			process.exit(1);
+		}
+	}
 
-    // Skip local plugins - they are not in remote and should not be touched
-    if (localManifest.local === true) {
-      localPlugins.push({ name, version: localManifest.version });
-      syncedPlugins[name] = localManifest;
-      continue;
-    }
+	console.log(`done in ${elapsed(t)}s`);
+}
 
-    if (remoteManifest) {
-      // Plugin exists in both - check if needs update
-      if (localManifest.version !== remoteManifest.version) {
-        updatedPlugins.push({
-          name,
-          oldVersion: localManifest.version,
-          newVersion: remoteManifest.version
-        });
-        // Use remote version (it's newer)
-        syncedPlugins[name] = remoteManifest;
-      } else {
-        keptPlugins.push({ name, version: localManifest.version });
-        syncedPlugins[name] = localManifest;
-      }
-    } else {
-      // Plugin only exists locally - keep it (source of truth)
-      keptPlugins.push({ name, version: localManifest.version });
-      syncedPlugins[name] = localManifest;
-    }
-  }
+// ------------------------------------------------------------
+// update command — install/update all plugins from remote
+// ------------------------------------------------------------
 
-  // Check for plugins that only exist in remote (not locally installed)
-  // These should be removed from registry (not synced)
-  for (const name of Object.keys(remoteRegistry.plugins || {})) {
-    if (!localRegistry.plugins?.[name]) {
-      removedPlugins.push({ name, version: remoteRegistry.plugins[name].version });
-      // Don't add to syncedPlugins - local is source of truth
-    }
-  }
+async function applyPlugin(name, manifest, mirror, isUpdate) {
+	const dest = path.join(PLUGINS_DIR, name);
+	process.stdout.write(`${isUpdate ? 'updating' : 'installing'} ${name}... `);
+	try {
+		if (isUpdate && await fs.pathExists(dest)) await fs.remove(dest);
+		const { size } = await installPluginFromRepo({ plugin: name, repo: mirror }, PLUGINS_DIR);
+		await installDeps(manifest, dest);
+		const registry = await loadLocalRegistry();
+		registry.plugins[name] = manifest;
+		await saveRegistry(registry);
+		console.log(`done (${formatSize(size)})`);
+		return { success: true, name, size };
+	} catch (e) {
+		console.log(`FAILED: ${e.message}`);
+		return { success: false, name, error: e.message };
+	}
+}
 
-  // Also check for plugins in plugins/ dir that aren't in registry at all
-  // Add them if they have a valid manyplug.json
-  if (await fs.pathExists(PLUGINS_DIR)) {
-    const entries = await fs.readdir(PLUGINS_DIR, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
+export async function updateCommand(options = {}) {
+	const t = Date.now();
+	const { remoteRegistry, selectedMirror } = await fetchRegistry();
+	const local = await loadLocalRegistry();
 
-      const manifestPath = path.join(PLUGINS_DIR, entry.name, 'manyplug.json');
-      if (await fs.pathExists(manifestPath)) {
-        if (!syncedPlugins[entry.name]) {
-          try {
-            const manifest = await fs.readJson(manifestPath);
-            newPlugins.push({ name: entry.name, version: manifest.version });
-            syncedPlugins[entry.name] = manifest;
-          } catch {
-            // Invalid manifest, skip
-          }
-        }
-      }
-    }
-  }
+	const toInstall = [], toUpdate = [], localOnly = [];
 
-  // Show changes
-  logger.newline();
-  logger.header('Sync Summary');
-  logger.separator();
+	for (const [name, rm] of Object.entries(remoteRegistry.plugins || {})) {
+		const onDisk = await fs.pathExists(path.join(PLUGINS_DIR, name));
+		if (!onDisk) continue; // not installed locally, skip
+		const lm = local.plugins?.[name];
+		if (lm?.version !== rm.version) toUpdate.push({ name, manifest: rm, from: lm?.version ?? '?', to: rm.version });
+	}
+	for (const name of Object.keys(local.plugins || {})) {
+		if (!remoteRegistry.plugins?.[name]) localOnly.push(name);
+	}
 
-  // Build summary table
-  const summaryData = [];
+	// plan
+	for (const p of toUpdate)  console.log(`~ ${p.name} ${p.from}->${p.to}`);
+	if (localOnly.length)      console.log(`L local only (skipped): ${localOnly.join(', ')}`);
 
-  // New plugins (from local dir)
-  if (newPlugins.length > 0) {
-    summaryData.push({
-      icon: chalk.green('+'),
-      label: 'Added to registry',
-      count: chalk.green(newPlugins.length),
-      detail: newPlugins.map(p => `${p.name} ${chalk.green(p.version)}`).join(', ')
-    });
-  }
+	const total = toUpdate.length;
+	if (!total) { console.log(`nothing to do  (${elapsed(t)}s)`); return; }
 
-  // Updated plugins
-  if (updatedPlugins.length > 0) {
-    summaryData.push({
-      icon: chalk.yellow('~'),
-      label: 'Updated',
-      count: chalk.yellow(updatedPlugins.length),
-      detail: updatedPlugins.map(p => `${p.name} ${chalk.gray(p.oldVersion)}→${chalk.green(p.newVersion)}`).join(', ')
-    });
-  }
+	// confirm
+	if (!options.yes) {
+		process.stdout.write(`${total} plugin(s) will be updated, continue? [y/N] `);
+		const answer = await new Promise(res => {
+			process.stdin.once('data', d => res(d.toString().trim().toLowerCase()));
+		});
+		if (answer !== 'y') { console.log('cancelled'); process.exit(0); }
+	}
 
-  // Kept (unchanged)
-  if (keptPlugins.length > 0) {
-    summaryData.push({
-      icon: chalk.gray('○'),
-      label: 'Unchanged',
-      count: chalk.gray(keptPlugins.length),
-      detail: ''
-    });
-  }
+	// run
+	const results = [];
+	const mirror  = selectedMirror.git;
+	for (const p of toUpdate)  results.push(await applyPlugin(p.name, p.manifest, mirror, true));
 
-  // Local plugins (not in remote)
-  if (localPlugins.length > 0) {
-    summaryData.push({
-      icon: chalk.magenta('⬤'),
-      label: 'Local only',
-      count: chalk.magenta(localPlugins.length),
-      detail: localPlugins.map(p => p.name).join(', ')
-    });
-  }
+	// summary
+	const ok  = results.filter(r => r.success).length;
+	const bad = results.length - ok;
+	const totalSize = results.reduce((a, r) => a + (r.size || 0), 0);
 
-  // Removed from remote (not in local)
-  if (removedPlugins.length > 0) {
-    summaryData.push({
-      icon: chalk.red('-'),
-      label: 'Skipped (not installed)',
-      count: chalk.red(removedPlugins.length),
-      detail: options.verbose ? removedPlugins.map(p => p.name).join(', ') : ''
-    });
-  }
-
-  if (summaryData.length > 0) {
-    const table = createTable(summaryData, [
-      { key: 'icon', header: '', minWidth: 2, format: v => v },
-      { key: 'label', header: 'Change', minWidth: 22 },
-      { key: 'count', header: 'Count', minWidth: 6, format: v => v },
-      { key: 'detail', header: 'Details', minWidth: 30, format: v => chalk.gray(v) }
-    ], { compact: true });
-    console.log(table.toString());
-  } else {
-    console.log(`  ${ICONS.success} ${chalk.green('Registry is up to date')}`);
-  }
-
-  logger.separator();
-  console.log(`  ${chalk.gray('Source:')} ${chalk.cyan(selectedMirror.name)}`);
-  console.log(`  ${chalk.gray('Remote plugins:')} ${chalk.gray(Object.keys(remoteRegistry.plugins || {}).length)}`);
-  console.log(`  ${chalk.gray('Local plugins:')} ${chalk.gray(Object.keys(localRegistry.plugins || {}).length)}`);
-  console.log(`  ${chalk.gray('Synced:')} ${chalk.white(Object.keys(syncedPlugins).length)}`);
-
-  // Save synced registry
-  const hasChanges = newPlugins.length > 0 || updatedPlugins.length > 0;
-
-  if (hasChanges || options.force) {
-    const syncSpinner = createSpinner('Saving registry...');
-    syncSpinner.start();
-
-    try {
-      await saveRegistry({ plugins: syncedPlugins });
-      syncSpinner.succeed('Registry synced');
-    } catch (err) {
-      syncSpinner.fail(`Failed: ${err.message}`);
-      process.exit(1);
-    }
-  }
-
-  // Final summary
-  const duration = Date.now() - startTime;
-  logger.newline();
-  logger.success(`Sync completed in ${formatDuration(duration)}`);
+	console.log(`\n${ok}/${results.length} updated in ${elapsed(t)}s  size=${formatSize(totalSize)}`);
+	process.exit(1);
 }
